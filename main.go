@@ -36,7 +36,7 @@ func (a accounts) update(transactions []Transaction) {
 func (a accounts) getMax() (addr string, value string) {
 	max := &big.Int{}
 	for k, v := range a {
-		if r := v.CmpAbs(max); r == 1 {
+		if v.CmpAbs(max) == 1 {
 			addr = k
 			max = v
 		}
