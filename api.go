@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
+
+	"golang.org/x/time/rate"
 )
+
+var errAPITimeout = errors.New("too many requests to api")
 
 const apiURL = "https://api.etherscan.io/api"
 
@@ -26,7 +30,13 @@ func (t *Transaction) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
-	t.From, _ = m["from"].(string)
+	v, ok := m["from"].(string)
+	if !ok {
+		return errors.New("error asserting type of 'from' to string")
+	}
+	t.From = v
+
+	// 'to' can be null if transaction creates smart contract
 	t.To, _ = m["to"].(string)
 
 	str, ok := m["value"].(string)
@@ -34,8 +44,7 @@ func (t *Transaction) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 
-	str = strings.Replace(str, "0x", "", 1)
-	num, ok := new(big.Int).SetString(str, 16)
+	num, ok := new(big.Int).SetString(str, 0)
 	if !ok {
 		return errors.New("error creating big.Int from string")
 	}
@@ -56,11 +65,12 @@ type Response struct {
 }
 
 type etherscanAPI struct {
-	client http.Client
-	token  string
+	client      *http.Client
+	rateLimiter *rate.Limiter
+	token       string
 }
 
-func (api etherscanAPI) getLastBlockNum() (int64, error) {
+func (api *etherscanAPI) getLastBlockNum() (uint64, error) {
 	u, err := url.Parse(apiURL)
 	if err != nil {
 		return 0, err
@@ -83,8 +93,7 @@ func (api etherscanAPI) getLastBlockNum() (int64, error) {
 		return 0, err
 	}
 
-	hexStr = strings.Replace(hexStr, "0x", "", 1)
-	num, err := strconv.ParseInt(hexStr, 16, 64)
+	num, err := strconv.ParseUint(hexStr, 0, 64)
 	if err != nil {
 		return 0, errors.New("error converting hex to integer")
 	}
@@ -92,7 +101,7 @@ func (api etherscanAPI) getLastBlockNum() (int64, error) {
 	return num, nil
 }
 
-func (api etherscanAPI) getBlockInfo(blockNum int64) (BlockInfo, error) {
+func (api *etherscanAPI) getBlockInfo(blockNum uint64) (BlockInfo, error) {
 	u, err := url.Parse(apiURL)
 	if err != nil {
 		return BlockInfo{}, err
@@ -121,6 +130,12 @@ func (api etherscanAPI) getBlockInfo(blockNum int64) (BlockInfo, error) {
 }
 
 func (api *etherscanAPI) makeRequest(u string) (Response, error) {
+	ctx := context.Background()
+	err := api.rateLimiter.Wait(ctx)
+	if err != nil {
+		return Response{}, err
+	}
+
 	resp, err := api.client.Get(u)
 	if err != nil {
 		return Response{}, err
@@ -128,7 +143,7 @@ func (api *etherscanAPI) makeRequest(u string) (Response, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return Response{}, fmt.Errorf("status code: %d; status: %s", resp.StatusCode, resp.Status)
+		return Response{}, fmt.Errorf("error: status code %d; status '%s'", resp.StatusCode, resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -143,8 +158,7 @@ func (api *etherscanAPI) makeRequest(u string) (Response, error) {
 	}
 
 	if apiResp.Status != "" {
-		return Response{}, fmt.Errorf("api error: status '%s'; message '%s'; result '%s'",
-			apiResp.Status, apiResp.Message, apiResp.Result)
+		return Response{}, errAPITimeout
 	}
 
 	return apiResp, nil
